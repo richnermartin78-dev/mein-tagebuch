@@ -20,6 +20,9 @@ let deferredPrompt = null;
 let sb = null;
 let currentUser = null;
 let syncRunning = false;
+let syncRequested = false;
+let syncFailed = false;
+let formBaseline = "";
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -71,19 +74,25 @@ function clearForm(keepDate=true){
   if(!keepDate) $("#entryDate").value=localISO();
   $("#formStatus").textContent="";
 }
-function saveEntry(){
+function readForm(){
   const date=$("#entryDate").value||localISO();
-  const now=new Date().toISOString();
-  const entry={
+  return {
     date,mood:selectedMood,energy:+$("#energy").value,tension:+$("#tension").value,sleep:+$("#sleep").value,
     thoughts:$("#thoughts").value.trim(),good:$("#good").value.trim(),hard:$("#hard").value.trim(),
     helped:$("#helped").value.trim(),moment:$("#moment").value.trim(),tomorrow:$("#tomorrow").value.trim(),
-    feelings:[...selectedFeelings],selfcare:[...selectedSelfcare],modifiedAt:now,dirty:true
+    feelings:[...selectedFeelings],selfcare:[...selectedSelfcare]
   };
+}
+function rememberForm(){formBaseline=JSON.stringify(readForm())}
+function hasFormChanges(){return !!formBaseline&&formBaseline!==JSON.stringify(readForm())}
+function saveEntry(){
+  const entry={...readForm(),modifiedAt:new Date().toISOString(),dirty:true},date=entry.date;
   let entries=getEntries();
   const i=entries.findIndex(e=>e.date===date);
   if(i>=0) entries[i]=entry; else entries.push(entry);
   entries.sort((a,b)=>a.date.localeCompare(b.date)); setEntries(entries);
+  setDeleteQueue(getDeleteQueue().filter(d=>d!==date));
+  rememberForm();
   $("#formStatus").textContent=`Gespeichert: ${niceDate(date)}`;
   renderAll(); toast(i>=0?"Eintrag aktualisiert":"Eintrag gespeichert");
   if(currentUser && navigator.onLine) syncNow(false);
@@ -91,13 +100,14 @@ function saveEntry(){
 function loadEntry(date){
   const e=getEntries().find(x=>x.date===date);
   clearForm(); $("#entryDate").value=date;
-  if(!e){$("#formStatus").textContent="Neuer Eintrag";return}
+  if(!e){$("#formStatus").textContent="Neuer Eintrag";rememberForm();return}
   setMood(e.mood||3);
   [["energy",e.energy??5],["tension",e.tension??5],["sleep",e.sleep??3]].forEach(([id,v])=>{$("#"+id).value=v;$("#"+id+"Val").textContent=v});
   ["thoughts","good","hard","helped","moment","tomorrow"].forEach(id=>$("#"+id).value=e[id]||"");
   selectedFeelings=new Set(e.feelings||[]);selectedSelfcare=new Set(e.selfcare||[]);
   $$(".chip").forEach(c=>{const set=c.dataset.kind==="feeling"?selectedFeelings:selectedSelfcare;c.classList.toggle("active",set.has(c.dataset.v))});
   $("#formStatus").textContent=e.dirty?"Lokal gespeichert · Synchronisierung ausstehend":"Gespeichert und synchronisiert";
+  rememberForm();
 }
 function go(screen){
   $$(".screen").forEach(s=>s.classList.toggle("active",s.id==="screen-"+screen));
@@ -131,6 +141,7 @@ window.deleteEntry=date=>{
   if(!confirm(`Eintrag vom ${niceDate(date)} wirklich löschen?`))return;
   setEntries(getEntries().filter(e=>e.date!==date));
   setDeleteQueue([...getDeleteQueue(),date]);
+  if($("#entryDate").value===date)loadEntry(date);
   renderAll(); toast("Eintrag gelöscht");
   if(currentUser&&navigator.onLine)syncNow(false);
 };
@@ -248,9 +259,9 @@ async function signUp(){
 async function signOut(){
   if(sb)await sb.auth.signOut();currentUser=null;renderAuthUI();updateSyncBadge();toast("Abgemeldet");
 }
-function toRemote(e){
+function toRemote(e,userId=currentUser.id){
   return {
-    user_id:currentUser.id,entry_date:e.date,mood:e.mood,energy:e.energy,tension:e.tension,sleep:e.sleep,
+    user_id:userId,entry_date:e.date,mood:e.mood,energy:e.energy,tension:e.tension,sleep:e.sleep,
     thoughts:e.thoughts||"",good:e.good||"",hard:e.hard||"",helped:e.helped||"",moment:e.moment||"",tomorrow:e.tomorrow||"",
     feelings:e.feelings||[],selfcare:e.selfcare||[],client_modified_at:e.modifiedAt||new Date().toISOString()
   };
@@ -263,74 +274,99 @@ function fromRemote(r){
   };
 }
 async function syncNow(showToast=true){
-  if(syncRunning)return;
+  if(syncRunning){syncRequested=true;return}
   if(!sb||!currentUser){if(showToast)toast("Nicht angemeldet");return}
   if(!navigator.onLine){if(showToast)toast("Offline – später synchronisieren");return}
-  syncRunning=true;updateSyncBadge("syncing");
+  const client=sb,userId=currentUser.id;
+  const sameAccount=()=>sb===client&&currentUser?.id===userId;
+  const revision=e=>JSON.stringify(e);
+  const timestamp=e=>Date.parse(e?.modifiedAt||0)||0;
+  let completed=false;
+  syncRunning=true;syncRequested=false;updateSyncBadge("syncing");
   try{
-    let entries=getEntries();
-    let deleteQueue=getDeleteQueue();
+    const entries=getEntries();
+    const initialByDate=new Map(entries.map(e=>[e.date,revision(e)]));
+    const deleteQueue=getDeleteQueue();
 
-    // 1) Explicit offline deletions are sent first.
+    // Acknowledge only deletions actually sent, leaving later deletions queued.
     for(const date of deleteQueue){
-      const {error}=await sb.from("journal_entries").delete().eq("user_id",currentUser.id).eq("entry_date",date);
+      if(!getDeleteQueue().includes(date))continue;
+      const {error}=await client.from("journal_entries").delete().eq("user_id",userId).eq("entry_date",date);
+      if(!sameAccount())return;
       if(error)throw error;
+      setDeleteQueue(getDeleteQueue().filter(d=>d!==date));
     }
-    if(deleteQueue.length){setDeleteQueue([]);deleteQueue=[]}
 
-    // 2) Read remote state. RLS restricts this to the signed-in user.
-    const {data:remote,error:readError}=await sb.from("journal_entries").select("*").eq("user_id",currentUser.id).order("entry_date");
+    const {data:remote,error:readError}=await client.from("journal_entries").select("*").eq("user_id",userId).order("entry_date");
+    if(!sameAccount())return;
     if(readError)throw readError;
     const remoteMap=new Map((remote||[]).map(r=>[r.entry_date,r]));
-    const localMap=new Map(entries.map(e=>[e.date,e]));
 
-    // 3) Merge. Newer modifiedAt wins. Dirty local-only entries are uploaded.
+    // Never upload an old snapshot after the user has edited or deleted it.
     for(const e of entries){
+      const current=getEntries().find(x=>x.date===e.date);
+      if(!current||revision(current)!==initialByDate.get(e.date)||getDeleteQueue().includes(e.date))continue;
       const r=remoteMap.get(e.date);
-      const lt=Date.parse(e.modifiedAt||0)||0,rt=Date.parse(r?.client_modified_at||r?.server_updated_at||0)||0;
+      const lt=timestamp(e),rt=Date.parse(r?.client_modified_at||r?.server_updated_at||0)||0;
       if(e.dirty && (!r || lt>=rt)){
-        const {error}=await sb.from("journal_entries").upsert(toRemote(e),{onConflict:"user_id,entry_date"});
-        if(error)throw error;e.dirty=false;
-      }else if(r && rt>lt){
-        Object.assign(e,fromRemote(r));
-      }else if(r && e.dirty){
-        e.dirty=false;
+        const {error}=await client.from("journal_entries").upsert(toRemote(e,userId),{onConflict:"user_id,entry_date"});
+        if(!sameAccount())return;
+        if(error)throw error;
       }
     }
 
-    // 4) Pull cloud-only entries. Remove local clean entries that were deleted on another device.
-    const afterDates=new Set((remote||[]).map(r=>r.entry_date));
-    entries=entries.filter(e=>e.dirty||afterDates.has(e.date)||remoteMap.has(e.date));
-    const present=new Set(entries.map(e=>e.date));
-    for(const r of (remote||[])){
-      if(!present.has(r.entry_date)){entries.push(fromRemote(r));present.add(r.entry_date)}
-    }
-
-    // 5) Re-fetch to include uploads from this sync and converge both sides.
-    const {data:fresh,error:freshError}=await sb.from("journal_entries").select("*").eq("user_id",currentUser.id).order("entry_date");
+    const {data:fresh,error:freshError}=await client.from("journal_entries").select("*").eq("user_id",userId).order("entry_date");
+    if(!sameAccount())return;
     if(freshError)throw freshError;
-    const dirtyByDate=new Map(entries.filter(e=>e.dirty).map(e=>[e.date,e]));
-    const merged=(fresh||[]).map(r=>dirtyByDate.get(r.entry_date)||fromRemote(r));
-    for(const e of entries){if(e.dirty&&!merged.some(x=>x.date===e.date))merged.push(e)}
-    merged.sort((a,b)=>a.date.localeCompare(b.date));setEntries(merged);
+
+    // Re-read local storage after all network waits. New local changes always
+    // survive this pass and are sent in a following pass.
+    const latest=getEntries(),latestDates=new Set(latest.map(e=>e.date));
+    const merged=new Map((fresh||[]).map(r=>[r.entry_date,fromRemote(r)]));
+    for(const e of entries){if(!latestDates.has(e.date))merged.delete(e.date)}
+    for(const e of latest){
+      const r=merged.get(e.date);
+      if(!initialByDate.has(e.date)||revision(e)!==initialByDate.get(e.date)){
+        merged.set(e.date,e);
+        if(e.dirty)syncRequested=true;
+      }else if(e.dirty&&(!r||timestamp(e)>timestamp(r))){
+        merged.set(e.date,e);syncRequested=true;
+      }
+    }
+    const pendingDeletes=getDeleteQueue();
+    for(const date of pendingDeletes)merged.delete(date);
+    if(pendingDeletes.length)syncRequested=true;
+    setEntries([...merged.values()].sort((a,b)=>a.date.localeCompare(b.date)));
 
     const now=new Date().toISOString();localStorage.setItem(LAST_SYNC_KEY,now);
     $("#lastSync").textContent=`Letzte Synchronisierung: ${new Date(now).toLocaleString("de-CH")}`;
-    renderAll();loadEntry($("#entryDate").value||localISO());updateSyncBadge("online");
-    if(showToast)toast("Synchronisierung abgeschlossen");
+    renderAll();
+    if(!hasFormChanges())loadEntry($("#entryDate").value||localISO());
+    completed=true;syncFailed=false;
+    if(showToast)toast(syncRequested?"Weitere Änderungen werden synchronisiert":"Synchronisierung abgeschlossen");
   }catch(err){
-    console.error(err);updateSyncBadge("error");
-    if(showToast)alert("Synchronisierung fehlgeschlagen: "+(err.message||err));
-  }finally{syncRunning=false}
+    console.error(err);
+    if(sameAccount()){
+      updateSyncBadge("error");
+      if(showToast)alert("Synchronisierung fehlgeschlagen: "+(err.message||err));
+    }
+  }finally{
+    syncRunning=false;updateSyncBadge();
+    if(completed&&syncRequested&&sameAccount()&&navigator.onLine)setTimeout(()=>syncNow(false),0);
+  }
 }
 function updateSyncBadge(force){
   const b=$("#syncBadge");
+  if(force==="error")syncFailed=true;
+  if(force==="syncing")syncFailed=false;
   b.className="sync-badge";
-  if(force==="syncing"){b.classList.add("syncing");b.textContent="↻ Sync";return}
-  if(force==="error"){b.classList.add("error");b.textContent="! Fehler";return}
-  if(currentUser&&navigator.onLine){b.classList.add("online");b.textContent="● Cloud"}
-  else if(!navigator.onLine)b.textContent="○ Offline";
-  else b.textContent="● Lokal";
+  if(!navigator.onLine){b.textContent="○ Offline";return}
+  if(syncFailed){b.classList.add("error");b.textContent="! Fehler";return}
+  if(syncRunning||force==="syncing"){b.classList.add("syncing");b.textContent="↻ Sync";return}
+  if(currentUser){
+    const pending=getEntries().filter(e=>e.dirty).length+getDeleteQueue().length;
+    b.classList.add(pending?"syncing":"online");b.textContent=pending?`↑ ${pending} offen`:"● Cloud";
+  }else b.textContent="● Lokal";
 }
 function exportFile(name,type,text){
   const blob=new Blob([text],{type}),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)
